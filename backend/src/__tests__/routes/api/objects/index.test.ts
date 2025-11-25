@@ -18,17 +18,25 @@ import { Upload as AwsUpload } from '@aws-sdk/lib-storage';
 jest.mock('../../../../utils/config', () => ({
   getS3Config: jest.fn(),
   getHFConfig: jest.fn(),
-  getMaxConcurrentTransfers: jest.fn(),
+  getMaxConcurrentTransfers: jest.fn().mockReturnValue(2), // Default value for transferQueue initialization
+  getProxyConfig: jest.fn().mockReturnValue({ httpProxy: undefined, httpsProxy: undefined }),
+}));
+
+// Mock localStorage utils
+jest.mock('../../../../utils/localStorage', () => ({
+  validatePath: jest.fn(),
 }));
 
 // Mock @aws-sdk/lib-storage AT THE TOP LEVEL of the describe or file
 const mockUploadDone = jest.fn();
 const mockUploadOn = jest.fn();
 jest.mock('@aws-sdk/lib-storage', () => ({
-  Upload: jest.fn().mockImplementation((): Partial<AwsUpload> => ({
-    done: mockUploadDone,
-    on: mockUploadOn,
-  })),
+  Upload: jest.fn().mockImplementation(
+    (): Partial<AwsUpload> => ({
+      done: mockUploadDone,
+      on: mockUploadOn,
+    }),
+  ),
 }));
 // Import Upload after mocking it, to get the mocked version
 import { Upload } from '@aws-sdk/lib-storage';
@@ -112,16 +120,62 @@ describe('Object Routes', () => {
       expect(payload.error).toBe('Error');
       expect(payload.message).toBe('Some other list error');
     });
+
+    it('should return pagination tokens when truncated', async () => {
+      s3Mock.on(ListObjectsV2Command, { Bucket: 'test-bucket', Delimiter: '/' }).resolves({
+        Contents: [{ Key: 'file1.txt' }],
+        CommonPrefixes: [{ Prefix: 'folder1/' }],
+        IsTruncated: true,
+        NextContinuationToken: 'TOKEN1',
+      });
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/test-bucket',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const payload = JSON.parse(response.payload);
+      expect(payload.isTruncated).toBe(true);
+      expect(payload.nextContinuationToken).toBe('TOKEN1');
+    });
+
+    it('should accept continuationToken query param for next page', async () => {
+      s3Mock
+        .on(ListObjectsV2Command, {
+          Bucket: 'test-bucket',
+          Delimiter: '/',
+          ContinuationToken: 'TOKEN1',
+        })
+        .resolves({
+          Contents: [{ Key: 'file2.txt' }],
+          CommonPrefixes: [],
+          IsTruncated: false,
+        });
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/test-bucket?continuationToken=TOKEN1',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const payload = JSON.parse(response.payload);
+      expect(payload.objects).toEqual([{ Key: 'file2.txt' }]);
+      expect(payload.isTruncated).toBe(false);
+      expect(payload.nextContinuationToken).toBeNull();
+    });
   });
 
   describe('GET /:bucketName/:prefix', () => {
     it('should list objects under a prefix successfully', async () => {
       const prefix = 'folder/subfolder/';
       const encodedPrefix = Buffer.from(prefix).toString('base64');
-      s3Mock.on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix, Delimiter: '/' }).resolves({
-        Contents: [{ Key: `${prefix}file3.txt` }],
-        CommonPrefixes: [{ Prefix: `${prefix}anotherfolder/` }],
-      });
+      s3Mock
+        .on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix, Delimiter: '/' })
+        .resolves({
+          Contents: [{ Key: `${prefix}file3.txt` }],
+          CommonPrefixes: [{ Prefix: `${prefix}anotherfolder/` }],
+        });
 
       const response = await fastify.inject({
         method: 'GET',
@@ -143,7 +197,9 @@ describe('Object Routes', () => {
         message: 'S3 List Error with Prefix',
         $metadata: { httpStatusCode: 404 },
       });
-      s3Mock.on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix, Delimiter: '/' }).rejects(s3Error);
+      s3Mock
+        .on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix, Delimiter: '/' })
+        .rejects(s3Error);
 
       const response = await fastify.inject({
         method: 'GET',
@@ -172,6 +228,57 @@ describe('Object Routes', () => {
       const payload = JSON.parse(response.payload);
       expect(payload.error).toBe('Error');
       expect(payload.message).toBe('Some other list error with prefix');
+    });
+
+    it('should return pagination tokens when truncated under a prefix', async () => {
+      const prefix = 'folder/subfolder/';
+      const encodedPrefix = Buffer.from(prefix).toString('base64');
+      s3Mock
+        .on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix, Delimiter: '/' })
+        .resolves({
+          Contents: [{ Key: prefix + 'fileA.txt' }],
+          CommonPrefixes: [{ Prefix: prefix + 'inner/' }],
+          IsTruncated: true,
+          NextContinuationToken: 'PTOKEN1',
+        });
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: `/test-bucket/${encodedPrefix}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const payload = JSON.parse(response.payload);
+      expect(payload.isTruncated).toBe(true);
+      expect(payload.nextContinuationToken).toBe('PTOKEN1');
+    });
+
+    it('should accept continuationToken for next page under a prefix', async () => {
+      const prefix = 'folder/subfolder/';
+      const encodedPrefix = Buffer.from(prefix).toString('base64');
+      s3Mock
+        .on(ListObjectsV2Command, {
+          Bucket: 'test-bucket',
+          Prefix: prefix,
+          Delimiter: '/',
+          ContinuationToken: 'PTOKEN1',
+        })
+        .resolves({
+          Contents: [{ Key: prefix + 'fileB.txt' }],
+          CommonPrefixes: [],
+          IsTruncated: false,
+        });
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: `/test-bucket/${encodedPrefix}?continuationToken=PTOKEN1`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const payload = JSON.parse(response.payload);
+      expect(payload.objects).toEqual([{ Key: prefix + 'fileB.txt' }]);
+      expect(payload.isTruncated).toBe(false);
+      expect(payload.nextContinuationToken).toBeNull();
     });
   });
 
@@ -325,10 +432,7 @@ describe('Object Routes', () => {
     it('should delete objects under a prefix successfully', async () => {
       const prefix = 'folderToDelete/';
       const encodedKey = Buffer.from(prefix).toString('base64');
-      const objectsInPrefix = [
-        { Key: `${prefix}file1.txt` },
-        { Key: `${prefix}file2.txt` },
-      ];
+      const objectsInPrefix = [{ Key: `${prefix}file1.txt` }, { Key: `${prefix}file2.txt` }];
 
       s3Mock.on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: prefix }).resolves({
         Contents: objectsInPrefix,
@@ -372,13 +476,13 @@ describe('Object Routes', () => {
       expect(payload.message).toBe('Access Denied to delete.');
     });
 
-     it('should handle S3ServiceException on DeleteObjectCommand', async () => {
+    it('should handle S3ServiceException on DeleteObjectCommand', async () => {
       const key = 'fileToDeleteSingleError.txt';
       const encodedKey = Buffer.from(key).toString('base64');
 
       // Mock ListObjectsV2Command to return no Contents, so DeleteObjectCommand is called
       s3Mock.on(ListObjectsV2Command, { Bucket: 'test-bucket', Prefix: key }).resolves({
-        Contents: [], 
+        Contents: [],
       });
       const s3DeleteError = new S3ServiceException({
         name: 'InternalError',
@@ -522,11 +626,11 @@ describe('Object Routes', () => {
       expect(resPayload.error).toBe('AccessDenied');
       expect(resPayload.message).toBe('Upload access denied.');
     });
-    
-    // Note: More detailed tests for huggingface model import logic 
+
+    // Note: More detailed tests for huggingface model import logic
     // and progress tracking could be added here, but would require
     // more complex mocking of external services and internal functions.
   });
 
   // Test suites for each route will be added here
-}); 
+});
